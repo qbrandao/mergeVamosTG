@@ -30,22 +30,14 @@ pub struct StrRecord {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TandemGenotypeRow {
-    #[serde(rename = "CHR")]
-    pub chrom: String,
-    #[serde(rename = "START")]
-    pub start: usize,
-    #[serde(rename = "END")]
-    pub end: usize,
-    #[serde(rename = "MOTIF")]
-    pub motif: String,
-    #[serde(rename = "GENE")]
-    pub gene: String,
-    #[serde(rename = "GENE_PART")]
-    pub gene_part: String,
-    #[serde(rename = "CN_FOR")]
-    pub cn_for: String,
-    #[serde(rename = "CN_REV")]
-    pub cn_rev: String,
+    pub chrom: String,     // Colonne 1 (index 0) : ex: chr1
+    pub start: usize,      // Colonne 2 (index 1) : ex: 231799889
+    pub end: usize,        // Colonne 3 (index 2) : ex: 231799934
+    pub motif: String,     // Colonne 4 (index 3) : ex: TCCCTTCCTCCCTTCC
+    pub gene: String,      // Colonne 5 (index 4) : Nom du gène
+    pub gene_part: String, // Colonne 6 (index 5) : Exon/Intron...
+    pub cn_for: String,    // Colonne 7 (index 6) : Copy number forward
+    pub cn_rev: String,    // Colonne 8 (index 7) : Copy number reverse
 }
 
 #[derive(Debug, Clone)]
@@ -90,16 +82,40 @@ fn open_vcf_file<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>, Box<dyn st
 
 pub fn parse_tandem_genotypes<P: AsRef<Path>>(path: P) -> Result<Vec<TandemGenotypeRow>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
-    let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(b'\t') 
-        .comment(Some(b'#'))
-        .from_reader(file);
-
+    let reader = std::io::BufReader::new(file);
     let mut records = Vec::new();
-    for result in rdr.deserialize() {
-        let record: TandemGenotypeRow = result?;
-        records.push(record);
+
+    // On crée le parser CSV configuré sans en-tête et tolérant
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(false) // Traite la première ligne directement comme de la donnée
+        .flexible(true)     // Évite les erreurs si le nombre de colonnes varie
+        .from_reader(std::io::Cursor::new(Vec::new())); // Instance temporaire pour la configuration
+
+    for line_result in reader.lines() {
+        let line = line_result?;
+        // Ignore manuellement toutes les lignes de commentaires ou les lignes vides
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+
+        // On parse la ligne brute tabulée de manière sécurisée
+        let mut string_reader = csv::ReaderBuilder::new()
+            .delimiter(b'\t')
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(line.as_bytes());
+
+        if let Some(result) = string_reader.deserialize::<TandemGenotypeRow>().next() {
+            match result {
+                Ok(record) => records.push(record),
+                Err(e) => {
+                    eprintln!("Avertissement : Impossible de lire une ligne Tandem-Genotypes : {}", e);
+                }
+            }
+        }
     }
+
     Ok(records)
 }
 
@@ -293,6 +309,22 @@ fn build_vcf_header() -> vcf::Header {
             "Caractéristiques génomiques"
         )
     );
+    builder = builder.add_info(
+        "CN_FOR",
+        Map::<Info>::new(
+            vcf::header::record::value::map::info::Number::Count(1),
+            vcf::header::record::value::map::info::Type::String,
+            "Copy number change in each DNA read covering the forward strand",
+        ),
+    );
+    builder = builder.add_info(
+        "CN_REV",
+        Map::<Info>::new(
+            vcf::header::record::value::map::info::Number::Count(1),
+            vcf::header::record::value::map::info::Type::String,
+            "Copy number change in each DNA read covering the reverse strand",
+        ),
+    );
     builder.build()
 }
 
@@ -370,6 +402,8 @@ pub fn write_combined_vcf(
         info_buf.insert("TG_END".to_string(), Some(VariantValue::from(tg_rec.end as i32)));
         info_buf.insert("TG_MOTIF".to_string(), Some(VariantValue::from(tg_rec.motif.clone())));
         info_buf.insert("RU".to_string(), Some(VariantValue::from(v_rec.motif.clone())));
+        info_buf.insert("CN_FOR".to_string(), Some(VariantValue::from(tg_rec.cn_for.clone())));
+        info_buf.insert("CN_REV".to_string(), Some(VariantValue::from(tg_rec.cn_rev.clone())));
 
         let final_start = std::cmp::min(v_rec.pos_start, tg_rec.start);
         let final_end = std::cmp::max(v_rec.pos_end, tg_rec.end);
@@ -405,7 +439,8 @@ pub fn write_combined_vcf(
         info_buf.insert("TG_START".to_string(), Some(VariantValue::from(tg_rec.start as i32)));
         info_buf.insert("TG_END".to_string(), Some(VariantValue::from(tg_rec.end as i32)));
         info_buf.insert("TG_MOTIF".to_string(), Some(VariantValue::from(tg_rec.motif.clone())));
-
+        info_buf.insert("CN_FOR".to_string(), Some(VariantValue::from(tg_rec.cn_for.clone())));
+        info_buf.insert("CN_REV".to_string(), Some(VariantValue::from(tg_rec.cn_rev.clone())));
         annotate_regions_full(&tg_rec.chrom, tg_rec.start, tg_rec.end, dict_genes, dict_exons, &centromere_coords, &hg38_telomeres, &mut info_buf);
 
         RecordBuf::builder()
