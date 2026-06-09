@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::Path;
 use std::env;
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, BufReader, Read, Seek}; // Ajout de Read et Seek pour la détection magique
 
 use rayon::prelude::*;
 
@@ -51,7 +51,7 @@ pub struct TandemGenotypeRow {
 #[derive(Debug, Clone)]
 struct TelomereCoords {
     p: (usize, usize),
-    q: Option<(usize, usize)>, // Option car q peut être None (chrX, chrY)
+    q: Option<(usize, usize)>, 
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +64,28 @@ struct GeneInfo {
 struct ExonInfo {
     start: usize,
     end: usize,
+}
+
+/// Fonction utilitaire ouvrant un fichier de manière transparente, 
+/// qu'il soit compressé (Gzip/BGZF) ou en texte brut.
+fn open_vcf_file<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>, Box<dyn std::error::Error>> {
+    let mut file = File::open(path)?;
+    
+    // On inspecte les 2 premiers octets (Magic Number)
+    let mut header = [0u8; 2];
+    let bytes_read = file.read(&mut header)?;
+    
+    // On rembobine pour que Noodles lise dès le début
+    file.rewind()?;
+
+    if bytes_read == 2 && header == [0x1f, 0x8b] {
+        // Format compressé
+        let decoder = GzDecoder::new(file);
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        // Format texte brut
+        Ok(Box::new(BufReader::new(file)))
+    }
 }
 
 pub fn parse_tandem_genotypes<P: AsRef<Path>>(path: P) -> Result<Vec<TandemGenotypeRow>, Box<dyn std::error::Error>> {
@@ -87,9 +109,9 @@ pub fn parse_vamos_vcf<P: AsRef<Path>>(
     records: &mut Vec<StrRecord>
 ) -> Result<(), Box<dyn std::error::Error>> {
     
-    let file = File::open(path)?;
-    let bgzf_reader = noodles::bgzf::Reader::new(file);
-    let mut reader = vcf::io::Reader::new(bgzf_reader);
+    // Utilisation du lecteur universel (gère texte brut ET g釐/bgzf)
+    let universal_reader = open_vcf_file(path)?;
+    let mut reader = vcf::io::Reader::new(universal_reader);
 
     let header = reader.read_header()?; 
 
@@ -193,7 +215,6 @@ fn parse_exons_bed<P: AsRef<Path>>(path: P) -> Result<HashMap<String, HashMap<St
 fn build_vcf_header() -> vcf::Header {
     let mut builder = vcf::Header::builder();
 
-    // Clé INFO pour la source
     builder = builder.add_info(
         "SOURCE",
         Map::<Info>::new(
@@ -203,7 +224,6 @@ fn build_vcf_header() -> vcf::Header {
         ),
     );
 
-    // Déclarations des métriques spécifiques à tandem-genotypes
     builder = builder.add_info(
         "TG_START",
         Map::<Info>::new(
@@ -234,7 +254,7 @@ fn build_vcf_header() -> vcf::Header {
     builder = builder.add_info(
         "CENTROMERE",
         Map::<Info>::new(
-            vcf::header::record::value::map::info::Number::Count(0), // 0 signifie que c'est un Flag (sans valeur associée)
+            vcf::header::record::value::map::info::Number::Count(0), 
             vcf::header::record::value::map::info::Type::Flag,
             "Le STR intersecte une zone centromérique",
         ),
@@ -274,37 +294,6 @@ fn build_vcf_header() -> vcf::Header {
         )
     );
     builder.build()
-}
-
-fn annotate_region(
-    chrom: &str, 
-    start: usize, 
-    end: usize, 
-    centromeres: &HashMap<&str, (usize, usize)>, 
-    telomeres: &HashMap<&str, TelomereCoords>,
-    info_buf: &mut noodles::vcf::variant::record_buf::Info
-) {
-    // Vérification du Centromère
-    if let Some(&(c_start, c_end)) = centromeres.get(chrom) {
-        // Condition d'intersection standard entre deux intervalles [start, end] et [c_start, c_end]
-        if start <= c_end && end >= c_start {
-            info_buf.insert("CENTROMERE".to_string(), None); // None car c'est un Type::Flag
-        }
-    }
-
-    // Vérification des Télomères
-    if let Some(t_coords) = telomeres.get(chrom) {
-        // Bras p
-        if start <= t_coords.p.1 && end >= t_coords.p.0 {
-            info_buf.insert("TELOMERE_P".to_string(), None);
-        }
-        // Bras q (si disponible)
-        if let Some(q_coords) = t_coords.q {
-            if start <= q_coords.1 && end >= q_coords.0 {
-                info_buf.insert("TELOMERE_Q".to_string(), None);
-            }
-        }
-    }
 }
 
 pub fn write_combined_vcf(
@@ -366,8 +355,6 @@ pub fn write_combined_vcf(
     ]);
 
     // ---- 1. PARALLÉLISATION : Génération des Records VCF en mémoire ----
-    
-    // On transforme le vecteur `commons` en parallèle grâce à .into_par_iter()
     let records_commons: Vec<RecordBuf> = commons.into_par_iter().map(|(v_rec, tg_rec)| {
         let vcf_pos = noodles::core::Position::try_from(v_rec.pos_start).unwrap();
 
@@ -392,7 +379,6 @@ pub fn write_combined_vcf(
         record_builder.set_info(info_buf).build()
     }).collect();
 
-    // On fait de même pour `vamos_only`
     let records_vamos: Vec<RecordBuf> = vamos_only.into_par_iter().map(|v_rec| {
         let vcf_pos = noodles::core::Position::try_from(v_rec.pos_start).unwrap();
 
@@ -411,7 +397,6 @@ pub fn write_combined_vcf(
             .build()
     }).collect();
 
-    // On fait de même pour `tg_only`
     let records_tg: Vec<RecordBuf> = tg_only.into_par_iter().map(|tg_rec| {
         let vcf_pos = noodles::core::Position::try_from(tg_rec.start).unwrap(); 
 
@@ -432,10 +417,7 @@ pub fn write_combined_vcf(
             .build()
     }).collect();
 
-
     // ---- 2. ÉCRITURE SÉQUENTIELLE DANS LE FICHIER VCF ----
-    // Rayon garantit que l'ordre initial des éléments est préservé lors du .collect()
-    
     for record in records_commons {
         writer.write_variant_record(&header, &record)?;
     }
@@ -468,13 +450,13 @@ fn annotate_regions_full(
     // 1. Analyse des gènes et exons
     if let Some(genes_on_chrom) = dict_genes.get(chrom) {
         for (g, gene_info) in genes_on_chrom {
+            // Utilisation robuste de l'intervalle [pos, pos_end]
             if pos_end >= gene_info.start && pos <= gene_info.end {
                 list_genes.push(g.clone());
 
                 if let Some(chrom_exons) = dict_exons.get(chrom) {
                     if let Some(exons) = chrom_exons.get(g) {
                         if !exons.is_empty() {
-                            // Trier les exons numériquement (ex: "exon1", "exon2")
                             let mut sorted_exons: Vec<&String> = exons.keys().collect();
                             sorted_exons.sort_by_key(|key| {
                                 key.replace("exon", "").parse::<usize>().unwrap_or(0)
@@ -487,19 +469,17 @@ fn annotate_regions_full(
                             let last_exon_start = exons[last_exon_name].start;
 
                             let strand = if first_exon_start < last_exon_start { "+" } else { "-" };
-
-                            // Flag pour savoir si on a déclenché un UTR
                             let mut utr_triggered = false;
 
-                            // Vérification 5' UTR
+                            // Vérification 5' UTR avec prise en compte de la largeur du variant
                             if (strand == "+" && pos < exons[first_exon_name].start)
-                                || (strand == "-" && pos > exons[first_exon_name].end)
+                                || (strand == "-" && pos_end > exons[first_exon_name].end)
                             {
                                 list_features.push("5'UTR".to_string());
                                 utr_triggered = true;
                             }
-                            // Vérification 3' UTR
-                            else if (strand == "+" && pos > exons[last_exon_name].end)
+                            // Vérification 3' UTR avec prise en compte de la largeur du variant
+                            else if (strand == "+" && pos_end > exons[last_exon_name].end)
                                 || (strand == "-" && pos < exons[last_exon_name].start)
                             {
                                 list_features.push("3'UTR".to_string());
@@ -508,15 +488,14 @@ fn annotate_regions_full(
 
                             if !utr_triggered {
                                 let mut found_exon = false;
-                                // Parcourir tous les exons pour voir s'il est dedans
                                 for (e, exon_info) in exons {
-                                    if exon_info.start < pos && pos < exon_info.end {
+                                    // Intersection d'intervalles propre
+                                    if pos_end >= exon_info.start && pos <= exon_info.end {
                                         list_features.push(e.clone());
                                         found_exon = true;
                                     }
                                 }
 
-                                // Si ce n'est ni UTR ni exonic, c'est intronique
                                 if !found_exon {
                                     list_features.push("intronic".to_string());
                                 }
@@ -534,26 +513,25 @@ fn annotate_regions_full(
         }
     }
 
-    // 2. Centromères
+    // 2. Centromères avec intersection propre
     if let Some(&(c_start, c_end)) = centromeres.get(chrom) {
-        if pos > c_start && pos < c_end {
+        if pos_end >= c_start && pos <= c_end {
             list_features.push("centromere".to_string());
         }
     }
 
-    // 3. Télomères
+    // 3. Télomères avec intersection propre
     if let Some(t_coords) = telomeres.get(chrom) {
         if let Some(q_coords) = t_coords.q {
-            if pos > q_coords.0 && pos < q_coords.1 {
+            if pos_end >= q_coords.0 && pos <= q_coords.1 {
                 list_features.push("telomere_q".to_string());
             }
         }
-        if pos > t_coords.p.0 && pos < t_coords.p.1 {
+        if pos_end >= t_coords.p.0 && pos <= t_coords.p.1 {
             list_features.push("telomere_p".to_string());
         }
     }
 
-    // 4. Traitement des cas vides par défaut
     if list_genes.is_empty() {
         list_genes.push("intergenic".to_string());
     }
@@ -561,10 +539,8 @@ fn annotate_regions_full(
         list_features.push(".".to_string());
     }
 
-    // Enlever les doublons potentiels dans les features
     list_features.dedup();
 
-    // 5. Injection dans le buffer INFO du VCF Noodles
     info_buf.insert("GENES".to_string(), Some(VariantValue::from(list_genes.join(","))));
     info_buf.insert("FEATURES".to_string(), Some(VariantValue::from(list_features.join(","))));
 }
@@ -587,61 +563,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let margin = 50; 
     let args: Vec<String> = env::args().collect();
     
-    let dict_genes = parse_genes_bed("/home/brandaoq/scripts/genes.bed.gz")?;
-    let dict_exons = parse_exons_bed("/home/brandaoq/scripts/MANE_Select_exons.bed.gz")?;
-    // Vérification de sécurité pour les arguments
     if args.len() < 5 {
         eprintln!("Usage: {} <vamos_hap1.vcf> <vamos_hap2.vcf> <tg_records.tsv> <output_file>", args[0]);
         std::process::exit(1);
     }
 
-    // 1. Lire VaMoS Hap1 et Hap2 dans une liste temporaire
+    let dict_genes = parse_genes_bed("/home/brandaoq/scripts/genes.bed.gz")?;
+    let dict_exons = parse_exons_bed("/home/brandaoq/scripts/MANE_Select_exons.bed.gz")?;
+
     let mut raw_vamos_records = Vec::new();
     parse_vamos_vcf(&args[1], "vamos_hap1", &mut raw_vamos_records)?;
     parse_vamos_vcf(&args[2], "vamos_hap2", &mut raw_vamos_records)?;
     
     println!("Nombre brut de STRs lus chez VaMoS (Hap1 + Hap2) : {}", raw_vamos_records.len());
 
-    // ---- FUSION DES DOUBLONS (Hap1 & Hap2) EN AMONT ----
     let mut collapsed_vamos: HashMap<(String, usize, String), StrRecord> = HashMap::new();
 
-    for mut record in raw_vamos_records {
-        // On crée une clé unique basée sur : Chromosome, Position de début, et le Motif Normalisé
+    // Suppression du 'mut' inutile devant 'record' pour éliminer l'avertissement
+    for record in raw_vamos_records {
         let key = (
             record.chrom.clone(),
             record.pos_start,
             normalize_motif(&record.motif),
         );
 
-        // Si la clé existe déjà, c'est que le variant est présent dans Hap1 ET Hap2
         if let Some(existing_record) = collapsed_vamos.get_mut(&key) {
             existing_record.source = "vamos_hap1_and_hap2".to_string();
         } else {
-            // Sinon, on l'ajoute pour la première fois
             collapsed_vamos.insert(key, record);
         }
     }
 
-    // On transforme notre dictionnaire fusionné en un vecteur pour la suite de l'algorithme
     let all_vamos_records: Vec<StrRecord> = collapsed_vamos.into_values().collect();
     println!("Nombre de STRs VaMoS uniques après fusion des haplotypes : {}", all_vamos_records.len());
 
-    // 2. Lire Tandem-Genotypes TSV
     let tg_records = parse_tandem_genotypes(&args[3])?;
 
-    // 3. Classification
     let mut commons = Vec::new();
     let mut vamos_only = Vec::new();
     let mut tg_only = tg_records.clone(); 
 
-    // On itère sur la liste dédoublonnée
     for v_rec in all_vamos_records {
         let mut found = false;
         
         for idx in 0..tg_only.len() {
             let tg_rec = &tg_only[idx];
-            
-            // Calcul de la distance absolue de manière sécurisée en Rust
             let diff_start = (v_rec.pos_start as isize - tg_rec.start as isize).abs();
             
             if v_rec.chrom == tg_rec.chrom 
@@ -649,7 +615,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                && normalize_motif(&v_rec.motif) == normalize_motif(&tg_rec.motif) 
             {
                 commons.push((v_rec.clone(), tg_rec.clone()));
-                tg_only.remove(idx); // Retire l'élément trouvé
+                tg_only.remove(idx); 
                 found = true;
                 break;
             }
