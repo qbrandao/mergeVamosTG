@@ -312,7 +312,7 @@ fn build_vcf_header() -> vcf::Header {
     builder = builder.add_info(
         "CN_FOR",
         Map::<Info>::new(
-            vcf::header::record::value::map::info::Number::Count(1),
+            vcf::header::record::value::map::info::Number::Unknown,
             vcf::header::record::value::map::info::Type::String,
             "Copy number change in each DNA read covering the forward strand",
         ),
@@ -320,7 +320,7 @@ fn build_vcf_header() -> vcf::Header {
     builder = builder.add_info(
         "CN_REV",
         Map::<Info>::new(
-            vcf::header::record::value::map::info::Number::Count(1),
+            vcf::header::record::value::map::info::Number::Unknown,
             vcf::header::record::value::map::info::Type::String,
             "Copy number change in each DNA read covering the reverse strand",
         ),
